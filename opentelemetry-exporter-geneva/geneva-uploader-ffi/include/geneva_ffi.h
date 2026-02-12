@@ -161,6 +161,59 @@ GenevaError geneva_encode_and_compress_spans(GenevaClientHandle* handle,
                                             char* err_msg_out,
                                             size_t err_msg_len);
 
+/* ----- Pre-encoded batch (raw Bond blobs from C++ callers) -----
+ *
+ * For callers that already produce Bond Simple Binary data (e.g., mdsd,
+ * Windows Monitoring Agent), this single function accepts raw schema bytes
+ * and raw row bytes, wraps them in the CentralBlob wire format, applies
+ * LZ4 compression, and returns upload-ready batches.
+ *
+ * The library performs NO Bond encoding — schema and row payloads are
+ * passed through as-is. The caller is responsible for producing valid
+ * Bond data.
+ *
+ * Workflow:
+ *   1. geneva_client_new()                    — create client
+ *   2. geneva_encode_preencoded_batch()       — pass Bond blobs, get EncodedBatches
+ *   3. geneva_upload_batch_sync()             — upload as usual
+ *   4. geneva_batches_free()                  — free encoded batches
+ */
+
+/* 1.2) Encode a batch of pre-encoded Bond rows sharing a pre-encoded Bond schema.
+
+      The library wraps the provided Bond bytes in the CentralBlob wire format,
+      applies LZ4 chunked compression, and returns upload-ready batches.
+      No Bond encoding is performed.
+
+      Parameters:
+      - handle: Client handle from geneva_client_new (required)
+      - schema_bytes: Bond Simple Binary encoded schema (required, not validated)
+      - schema_len: Length of schema_bytes
+      - event_name: Shared event name for all rows, null-terminated UTF-8 (required)
+      - level: Shared severity level for all rows (0-255)
+      - row_count: Number of rows (required, > 0)
+      - timestamps: Array of row_count uint64_t timestamps (nanoseconds since epoch)
+      - row_ptrs: Array of row_count pointers to Bond Simple Binary row data
+      - row_lens: Array of row_count lengths for each row blob
+      - out_batches: Receives the batches handle on success (required)
+      - err_msg_out: Optional buffer to receive error message (can be NULL)
+      - err_msg_len: Size of err_msg_out buffer
+
+      All pointed-to data must remain valid for the duration of this call.
+      Caller must free *out_batches with geneva_batches_free. */
+GenevaError geneva_encode_preencoded_batch(GenevaClientHandle* handle,
+                                           const uint8_t* schema_bytes,
+                                           size_t schema_len,
+                                           const char* event_name,
+                                           uint8_t level,
+                                           size_t row_count,
+                                           const uint64_t* timestamps,
+                                           const uint8_t* const* row_ptrs,
+                                           const size_t* row_lens,
+                                           EncodedBatchesHandle** out_batches,
+                                           char* err_msg_out,
+                                           size_t err_msg_len);
+
 // 2) Query number of batches.
 size_t geneva_batches_len(const EncodedBatchesHandle* batches);
 

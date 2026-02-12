@@ -20,6 +20,17 @@ pub struct EncodedBatch {
     pub row_count: usize,
 }
 
+/// A pre-serialized row for the pre-encoded batch path.
+/// Used with [`GenevaClient::encode_preencoded_batch`] for callers that
+/// already produce Bond Simple Binary data (e.g., mdsd, Windows MA).
+#[derive(Debug, Clone)]
+pub struct RawRow {
+    /// Timestamp in nanoseconds since Unix epoch
+    pub timestamp_ns: u64,
+    /// Pre-serialized Bond Simple Binary row data (field values in schema order)
+    pub row_data: Vec<u8>,
+}
+
 /// Configuration for GenevaClient (user-facing)
 #[derive(Clone, Debug)]
 pub struct GenevaClientConfig {
@@ -206,6 +217,116 @@ impl GenevaClient {
                 );
                 format!("Compression failed: {e}")
             })
+    }
+
+    /// Encode a batch of pre-encoded Bond rows sharing a pre-encoded Bond schema.
+    ///
+    /// This is the "fully raw" encoding path for callers that already produce
+    /// Bond Simple Binary data (e.g., mdsd, Windows MA). The library performs
+    /// NO Bond encoding — it only wraps the provided bytes in the CentralBlob
+    /// wire format, applies LZ4 compression, and returns upload-ready batches.
+    ///
+    /// # Arguments
+    /// - `schema_bytes` — Bond-encoded schema (Simple Binary). Passed through as-is.
+    /// - `event_name`   — Shared event name for all rows in the batch.
+    /// - `level`        — Severity / verbosity level (0-255).
+    /// - `rows`         — Each `RawRow` carries a timestamp and pre-serialized
+    ///                    Bond Simple Binary row data.
+    pub fn encode_preencoded_batch(
+        &self,
+        schema_bytes: &[u8],
+        event_name: &str,
+        level: u8,
+        rows: &[RawRow],
+    ) -> Result<Vec<EncodedBatch>, String> {
+        use crate::payload_encoder::bond_encoder::BondEncodedSchema;
+        use crate::payload_encoder::central_blob::{
+            CentralBlob, CentralEventEntry, CentralSchemaEntry,
+        };
+        use crate::payload_encoder::lz4_chunked_compression::lz4_chunked_compression;
+
+        if rows.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // Wrap caller-provided schema bytes (no Bond encoding performed)
+        let schema = BondEncodedSchema::from_raw_bytes(schema_bytes);
+        let schema_md5 = md5::compute(schema.as_bytes()).0;
+
+        let schema_entry = CentralSchemaEntry {
+            id: 1,
+            md5: schema_md5,
+            schema,
+            fields: Vec::new(), // Not needed — single schema, no dedup
+        };
+
+        let schema_ids = format!("{:x}", md5::Digest(schema_md5));
+
+        // Build events and track timestamp range
+        let event_name_arc = Arc::new(event_name.to_string());
+        let mut start_time = u64::MAX;
+        let mut end_time = 0u64;
+
+        let mut events = Vec::with_capacity(rows.len());
+        for row in rows {
+            if row.timestamp_ns != 0 {
+                start_time = start_time.min(row.timestamp_ns);
+                end_time = end_time.max(row.timestamp_ns);
+            }
+            events.push(CentralEventEntry {
+                schema_id: 1,
+                level,
+                event_name: Arc::clone(&event_name_arc),
+                row: row.row_data.clone(),
+            });
+        }
+
+        // Build blob
+        let blob = CentralBlob {
+            version: 1,
+            format: 2,
+            metadata: self.metadata_fields.metadata_string().to_owned(),
+            schemas: vec![schema_entry],
+            events,
+        };
+
+        // Compress
+        let uncompressed = blob.to_bytes();
+        let compressed = lz4_chunked_compression(&uncompressed).map_err(|e| {
+            debug!(
+                name: "client.encode_preencoded_batch.compress_error",
+                target: "geneva-uploader",
+                event_name = %event_name,
+                error = %e,
+                "LZ4 compression failed"
+            );
+            format!("compression failed: {e}")
+        })?;
+
+        debug!(
+            name: "client.encode_preencoded_batch",
+            target: "geneva-uploader",
+            event_name = %event_name,
+            rows = rows.len(),
+            uncompressed_size = uncompressed.len(),
+            compressed_size = compressed.len(),
+            "Encoded pre-encoded batch"
+        );
+
+        Ok(vec![EncodedBatch {
+            event_name: event_name.to_string(),
+            data: compressed,
+            metadata: crate::payload_encoder::central_blob::BatchMetadata {
+                start_time: if start_time == u64::MAX {
+                    0
+                } else {
+                    start_time
+                },
+                end_time,
+                schema_ids,
+            },
+            row_count: rows.len(),
+        }])
     }
 
     /// Upload a single compressed batch.

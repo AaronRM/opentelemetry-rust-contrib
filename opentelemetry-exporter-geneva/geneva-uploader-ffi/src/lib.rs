@@ -664,6 +664,132 @@ pub unsafe extern "C" fn geneva_encode_and_compress_spans(
     }
 }
 
+// ---------- Pre-encoded batch (raw Bond blobs from C++ callers) ----------
+//
+// For callers that already produce Bond Simple Binary data (e.g., mdsd,
+// Windows Monitoring Agent), this single function accepts raw schema bytes
+// and raw row bytes, wraps them in the CentralBlob wire format, applies
+// LZ4 compression, and returns upload-ready batches.
+//
+// The library performs NO Bond encoding — it is a pass-through for the
+// schema and row payloads. The caller is responsible for producing valid
+// Bond data.
+
+/// Encode a batch of pre-encoded Bond rows sharing a pre-encoded Bond schema.
+///
+/// # Safety
+/// - `handle` must be a valid pointer returned by `geneva_client_new`
+/// - `schema_bytes[0..schema_len-1]` must be valid Bond Simple Binary schema data
+/// - `event_name` must be a valid null-terminated UTF-8 string
+/// - `timestamps[0..row_count-1]` must be valid uint64 nanosecond timestamps
+/// - `row_ptrs[0..row_count-1]` must each point to `row_lens[i]` bytes of
+///   valid Bond Simple Binary row data
+/// - All pointed-to data must remain valid for the duration of this call
+/// - `out_batches` must be non-null; on success the caller must free it
+///   with `geneva_batches_free`
+#[no_mangle]
+pub unsafe extern "C" fn geneva_encode_preencoded_batch(
+    handle: *mut GenevaClientHandle,
+    schema_bytes: *const u8,
+    schema_len: usize,
+    event_name: *const c_char,
+    level: u8,
+    row_count: usize,
+    timestamps: *const u64,
+    row_ptrs: *const *const u8,
+    row_lens: *const usize,
+    out_batches: *mut *mut EncodedBatchesHandle,
+    err_msg_out: *mut c_char,
+    err_msg_len: usize,
+) -> GenevaError {
+    // Validate output pointer
+    if out_batches.is_null() {
+        return GenevaError::NullPointer;
+    }
+    unsafe { *out_batches = ptr::null_mut() };
+
+    // Validate required input pointers
+    if handle.is_null()
+        || schema_bytes.is_null()
+        || event_name.is_null()
+        || timestamps.is_null()
+        || row_ptrs.is_null()
+        || row_lens.is_null()
+    {
+        return GenevaError::NullPointer;
+    }
+    if schema_len == 0 || row_count == 0 {
+        return GenevaError::EmptyInput;
+    }
+
+    // Validate handle
+    let validation_result = unsafe { validate_handle(handle) };
+    if validation_result != GenevaError::Success {
+        return validation_result;
+    }
+
+    let handle_ref = unsafe { handle.as_ref().unwrap() };
+
+    // Convert event name
+    let event_name_str = match unsafe { CStr::from_ptr(event_name) }.to_str() {
+        Ok(s) => s,
+        Err(e) => {
+            unsafe { write_error_if_provided(err_msg_out, err_msg_len, &e) };
+            return GenevaError::InvalidData;
+        }
+    };
+
+    // Build schema slice (zero-copy)
+    let schema_slice = unsafe { std::slice::from_raw_parts(schema_bytes, schema_len) };
+
+    // Build rows from parallel arrays
+    let ts_slice = unsafe { std::slice::from_raw_parts(timestamps, row_count) };
+    let ptr_slice = unsafe { std::slice::from_raw_parts(row_ptrs, row_count) };
+    let len_slice = unsafe { std::slice::from_raw_parts(row_lens, row_count) };
+
+    let mut rows = Vec::with_capacity(row_count);
+    for i in 0..row_count {
+        if ptr_slice[i].is_null() && len_slice[i] > 0 {
+            unsafe {
+                write_error_if_provided(
+                    err_msg_out,
+                    err_msg_len,
+                    &format!("row {i} has null data pointer with non-zero length"),
+                )
+            };
+            return GenevaError::NullPointer;
+        }
+        let row_data = if len_slice[i] == 0 {
+            Vec::new()
+        } else {
+            unsafe { std::slice::from_raw_parts(ptr_slice[i], len_slice[i]) }.to_vec()
+        };
+        rows.push(geneva_uploader::RawRow {
+            timestamp_ns: ts_slice[i],
+            row_data,
+        });
+    }
+
+    // Delegate to library for CentralBlob assembly + LZ4 compression
+    match handle_ref
+        .client
+        .encode_preencoded_batch(schema_slice, event_name_str, level, &rows)
+    {
+        Ok(batches) => {
+            let h = EncodedBatchesHandle {
+                magic: GENEVA_HANDLE_MAGIC,
+                batches,
+            };
+            unsafe { *out_batches = Box::into_raw(Box::new(h)) };
+            GenevaError::Success
+        }
+        Err(e) => {
+            unsafe { write_error_if_provided(err_msg_out, err_msg_len, &e) };
+            GenevaError::InternalError
+        }
+    }
+}
+
 /// Returns the number of batches in the encoded batches handle
 ///
 /// # Safety

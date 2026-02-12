@@ -389,6 +389,15 @@ impl BondEncodedSchema {
         }
     }
 
+    /// Wrap caller-provided, pre-encoded Bond schema bytes.
+    /// The library does NOT validate the contents — the caller is responsible
+    /// for producing valid Bond Simple Binary schema data.
+    pub(crate) fn from_raw_bytes(bytes: &[u8]) -> Self {
+        Self {
+            data: Arc::new(bytes.to_vec()),
+        }
+    }
+
     pub(crate) fn as_bytes(&self) -> &[u8] {
         &self.data
     }
