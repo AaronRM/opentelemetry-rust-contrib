@@ -161,6 +161,109 @@ GenevaError geneva_encode_and_compress_spans(GenevaClientHandle* handle,
                                             char* err_msg_out,
                                             size_t err_msg_len);
 
+/* ----- Row writer batch encoding (Bond-free caller interface) -----
+ *
+ * This API lets callers with any in-memory data format (key-value bags,
+ * mmap-backed structs, column stores, etc.) encode data for Geneva without
+ * OTLP conversion and without any knowledge of Bond serialization.
+ *
+ * Workflow:
+ *   1. geneva_batch_begin()             — declare schema (field names + types)
+ *   2. For each record:
+ *      a. geneva_row_begin()            — start a new row with its timestamp
+ *      b. geneva_row_write_string()     — write fields in schema order
+ *         geneva_row_write_int32()
+ *         geneva_row_write_int64()
+ *         ...
+ *   3. geneva_batch_finish()            — finalize, compress, get EncodedBatches
+ *   4. geneva_upload_batch_sync()       — upload as usual
+ *
+ * PERFORMANCE / LTO NOTE:
+ * Each geneva_row_write_* call crosses the FFI boundary (~2-5ns indirect call).
+ * For 10K records × 20 fields = 200K calls ≈ 0.4-1ms — typically negligible
+ * compared to LZ4 compression and HTTP upload.
+ *
+ * For maximum throughput, enable Link-Time Optimization (LTO) when statically
+ * linking. With LTO the compiler can inline these calls across the Rust/C++
+ * boundary, eliminating the indirect call overhead entirely.
+ */
+
+/* Opaque batch builder handle */
+typedef struct GenevaBatchBuilderHandle GenevaBatchBuilderHandle;
+
+/* Logical type tags for field values. These are NOT Bond types —
+   the library maps them internally. */
+typedef enum {
+    GENEVA_TYPE_STRING = 0,   /* UTF-8 string */
+    GENEVA_TYPE_INT32  = 1,   /* int32_t */
+    GENEVA_TYPE_INT64  = 2,   /* int64_t */
+    GENEVA_TYPE_UINT32 = 3,   /* uint32_t */
+    GENEVA_TYPE_DOUBLE = 4,   /* double (64-bit) */
+    GENEVA_TYPE_BOOL   = 5,   /* uint8_t (0 = false, nonzero = true) */
+} GenevaFieldType;
+
+/* Describes one field in the schema. */
+typedef struct {
+    const char*    name;        /* Field name, UTF-8, null-terminated.
+                                   Must remain valid until finish/free. */
+    GenevaFieldType field_type; /* Logical type of the field */
+} GenevaFieldDef;
+
+/* Begin building a batch with a fixed schema.
+   All rows must provide field values in the same order as `fields`.
+
+   On success returns GENEVA_SUCCESS and writes *out_builder.
+   Caller must eventually call geneva_batch_finish() or
+   geneva_batch_builder_free(). */
+GenevaError geneva_batch_begin(GenevaClientHandle* handle,
+                               const GenevaFieldDef* fields,
+                               size_t field_count,
+                               const char* event_name,
+                               uint8_t level,
+                               GenevaBatchBuilderHandle** out_builder,
+                               char* err_msg_out,
+                               size_t err_msg_len);
+
+/* Begin a new row. Must be called before writing field values for each record.
+   If a previous row was in progress, it is automatically finalized. */
+GenevaError geneva_row_begin(GenevaBatchBuilderHandle* builder,
+                             uint64_t timestamp_ns);
+
+/* Write field values. Must be called in schema order for the current row. */
+GenevaError geneva_row_write_string(GenevaBatchBuilderHandle* builder,
+                                    const uint8_t* ptr,
+                                    size_t len);
+
+GenevaError geneva_row_write_int32(GenevaBatchBuilderHandle* builder,
+                                   int32_t value);
+
+GenevaError geneva_row_write_int64(GenevaBatchBuilderHandle* builder,
+                                   int64_t value);
+
+GenevaError geneva_row_write_uint32(GenevaBatchBuilderHandle* builder,
+                                    uint32_t value);
+
+GenevaError geneva_row_write_double(GenevaBatchBuilderHandle* builder,
+                                    double value);
+
+GenevaError geneva_row_write_bool(GenevaBatchBuilderHandle* builder,
+                                  uint8_t value);
+
+/* Finish the batch: finalize the last row, assemble CentralBlob,
+   compress with LZ4, and return encoded batches.
+
+   The builder is consumed and freed by this call — do NOT call
+   geneva_batch_builder_free() afterwards. */
+GenevaError geneva_batch_finish(GenevaClientHandle* handle,
+                                GenevaBatchBuilderHandle* builder,
+                                EncodedBatchesHandle** out_batches,
+                                char* err_msg_out,
+                                size_t err_msg_len);
+
+/* Free a batch builder without finishing it (discard accumulated data).
+   Safe to call with NULL (no-op). Do NOT call after geneva_batch_finish(). */
+void geneva_batch_builder_free(GenevaBatchBuilderHandle* builder);
+
 // 2) Query number of batches.
 size_t geneva_batches_len(const EncodedBatchesHandle* batches);
 

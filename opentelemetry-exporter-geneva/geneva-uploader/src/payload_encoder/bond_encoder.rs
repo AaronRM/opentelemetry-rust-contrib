@@ -9,7 +9,7 @@ use std::sync::Arc;
 #[repr(u8)]
 #[allow(non_camel_case_types)] // Allow C-style naming for clarity with Bond protocol
 #[allow(dead_code)] // These represent all possible Bond types, not all are used yet
-pub(crate) enum BondDataType {
+pub enum BondDataType {
     BT_STOP = 0,
     BT_STOP_BASE = 1,
     BT_BOOL = 2,
@@ -33,11 +33,11 @@ pub(crate) enum BondDataType {
 }
 
 /// Bond protocol writer for encoding values to buffers
-pub(crate) struct BondWriter;
+pub struct BondWriter;
 
 // Trait for types that can be converted to little-endian bytes
 /// This is automatically implemented for all primitive numeric types
-pub(crate) trait ToLeBytes {
+pub trait ToLeBytes {
     type ByteArray: AsRef<[u8]>;
     fn to_le_bytes(self) -> Self::ByteArray;
 }
@@ -99,7 +99,7 @@ impl BondWriter {
 
 /// Field definition for dynamic schemas
 #[derive(Clone, Debug)]
-pub(crate) struct FieldDef {
+pub struct FieldDef {
     pub name: Cow<'static, str>,
     pub field_id: u16,
     pub type_id: BondDataType,

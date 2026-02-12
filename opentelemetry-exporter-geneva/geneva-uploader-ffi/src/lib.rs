@@ -664,6 +664,495 @@ pub unsafe extern "C" fn geneva_encode_and_compress_spans(
     }
 }
 
+// ---------- Row writer batch encoding (Bond-free caller interface) ----------
+//
+// PERFORMANCE NOTE: Each geneva_row_write_* call crosses the FFI boundary.
+// For high-throughput scenarios (>100K records/sec), enable Link-Time Optimization
+// (LTO) when statically linking the Rust library into your C/C++ application.
+// With LTO, the compiler can inline these calls across the language boundary,
+// eliminating the indirect call overhead entirely.
+//
+// Without LTO, each call is an indirect function call (~2-5ns). For a batch of
+// 10,000 records × 20 fields = 200,000 calls ≈ 0.4-1ms, which is typically
+// negligible compared to LZ4 compression and HTTP upload time.
+
+/// Field definition for the row writer schema.
+/// The caller declares these once to define the column layout.
+#[repr(C)]
+pub struct GenevaFieldDef {
+    /// Field name, UTF-8, null-terminated. Must remain valid until `geneva_batch_finish`.
+    pub name: *const c_char,
+    /// Field type. The library maps this internally to the appropriate encoding.
+    pub field_type: GenevaFieldType,
+}
+
+/// Logical type tags for field values.
+/// These are NOT Bond types — the library maps them internally.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum GenevaFieldType {
+    /// UTF-8 string
+    String = 0,
+    /// 32-bit signed integer
+    Int32 = 1,
+    /// 64-bit signed integer
+    Int64 = 2,
+    /// 32-bit unsigned integer
+    Uint32 = 3,
+    /// 64-bit floating point
+    Double = 4,
+    /// Boolean (0 = false, nonzero = true)
+    Bool = 5,
+}
+
+/// Opaque batch builder handle. Accumulates rows streamed via `geneva_row_write_*`,
+/// then produces compressed `EncodedBatch`es on `geneva_batch_finish`.
+pub struct GenevaBatchBuilderHandle {
+    magic: u64,
+    /// Cached FieldDef vec (built once in `begin`)
+    field_defs: Vec<geneva_uploader::FieldDef>,
+    /// Expected field types in order (for validation)
+    field_types: Vec<GenevaFieldType>,
+    /// Event name shared by all rows
+    event_name: String,
+    /// Severity level shared by all rows
+    level: u8,
+    /// Accumulated rows
+    rows: Vec<geneva_uploader::RawRow>,
+    /// Current row being built (in-progress Bond bytes)
+    current_row: Vec<u8>,
+    /// Timestamp for the current row
+    current_timestamp_ns: u64,
+    /// Number of fields written to the current row (for validation)
+    current_field_index: usize,
+}
+
+impl ValidatedHandle for GenevaBatchBuilderHandle {
+    fn magic(&self) -> u64 {
+        self.magic
+    }
+    fn set_magic(&mut self, magic: u64) {
+        self.magic = magic;
+    }
+}
+
+/// Begin building a batch with a fixed schema.
+///
+/// All rows added to this builder must provide field values in the same order
+/// as the `fields` array, using the corresponding `geneva_row_write_*` function
+/// for each field's declared type.
+///
+/// # Safety
+/// - `handle` must be a valid pointer returned by `geneva_client_new`
+/// - `fields[0..field_count-1]` must be valid `GenevaFieldDef` entries
+/// - `event_name` must be a valid null-terminated UTF-8 string
+/// - Field name pointers must remain valid until `geneva_batch_finish` or
+///   `geneva_batch_builder_free` is called
+/// - `out_builder` must be non-null
+#[no_mangle]
+pub unsafe extern "C" fn geneva_batch_begin(
+    handle: *mut GenevaClientHandle,
+    fields: *const GenevaFieldDef,
+    field_count: usize,
+    event_name: *const c_char,
+    level: u8,
+    out_builder: *mut *mut GenevaBatchBuilderHandle,
+    err_msg_out: *mut c_char,
+    err_msg_len: usize,
+) -> GenevaError {
+    if out_builder.is_null() {
+        return GenevaError::NullPointer;
+    }
+    unsafe { *out_builder = ptr::null_mut() };
+
+    if handle.is_null() || fields.is_null() || event_name.is_null() {
+        return GenevaError::NullPointer;
+    }
+    if field_count == 0 {
+        return GenevaError::EmptyInput;
+    }
+
+    let validation_result = unsafe { validate_handle(handle) };
+    if validation_result != GenevaError::Success {
+        return validation_result;
+    }
+
+    let event_name_str = match unsafe { CStr::from_ptr(event_name) }.to_str() {
+        Ok(s) => s,
+        Err(e) => {
+            unsafe { write_error_if_provided(err_msg_out, err_msg_len, &e) };
+            return GenevaError::InvalidData;
+        }
+    };
+
+    let field_slice = unsafe { std::slice::from_raw_parts(fields, field_count) };
+
+    let mut field_defs = Vec::with_capacity(field_count);
+    let mut field_types = Vec::with_capacity(field_count);
+
+    for (i, f) in field_slice.iter().enumerate() {
+        if f.name.is_null() {
+            unsafe {
+                write_error_if_provided(
+                    err_msg_out,
+                    err_msg_len,
+                    &format!("field {i} has null name"),
+                )
+            };
+            return GenevaError::NullPointer;
+        }
+        let name_str = match unsafe { CStr::from_ptr(f.name) }.to_str() {
+            Ok(s) => s,
+            Err(e) => {
+                unsafe { write_error_if_provided(err_msg_out, err_msg_len, &e) };
+                return GenevaError::InvalidData;
+            }
+        };
+
+        let bond_type = match f.field_type {
+            GenevaFieldType::String => geneva_uploader::BondDataType::BT_STRING,
+            GenevaFieldType::Int32 => geneva_uploader::BondDataType::BT_INT32,
+            GenevaFieldType::Int64 => geneva_uploader::BondDataType::BT_INT64,
+            GenevaFieldType::Uint32 => geneva_uploader::BondDataType::BT_UINT32,
+            GenevaFieldType::Double => geneva_uploader::BondDataType::BT_DOUBLE,
+            GenevaFieldType::Bool => geneva_uploader::BondDataType::BT_BOOL,
+        };
+
+        field_defs.push(geneva_uploader::FieldDef {
+            name: std::borrow::Cow::Owned(name_str.to_string()),
+            field_id: (i + 1) as u16,
+            type_id: bond_type,
+        });
+        field_types.push(f.field_type);
+    }
+
+    let builder = GenevaBatchBuilderHandle {
+        magic: GENEVA_HANDLE_MAGIC,
+        field_defs,
+        field_types,
+        event_name: event_name_str.to_string(),
+        level,
+        rows: Vec::new(),
+        current_row: Vec::new(),
+        current_timestamp_ns: 0,
+        current_field_index: 0,
+    };
+
+    unsafe { *out_builder = Box::into_raw(Box::new(builder)) };
+    GenevaError::Success
+}
+
+/// Begin a new row within the batch.
+///
+/// Must be called before writing field values for each record.
+/// If a previous row was in progress, it is automatically finalized.
+///
+/// # Safety
+/// - `builder` must be a valid pointer returned by `geneva_batch_begin`
+#[no_mangle]
+pub unsafe extern "C" fn geneva_row_begin(
+    builder: *mut GenevaBatchBuilderHandle,
+    timestamp_ns: u64,
+) -> GenevaError {
+    if builder.is_null() {
+        return GenevaError::NullPointer;
+    }
+    let validation_result = unsafe { validate_handle(builder as *const _) };
+    if validation_result != GenevaError::Success {
+        return validation_result;
+    }
+
+    let b = unsafe { builder.as_mut().unwrap() };
+
+    // Finalize previous row if one was in progress
+    if b.current_field_index > 0 {
+        if b.current_field_index != b.field_defs.len() {
+            return GenevaError::InvalidData; // incomplete previous row
+        }
+        let row = geneva_uploader::RawRow {
+            timestamp_ns: b.current_timestamp_ns,
+            row_data: std::mem::take(&mut b.current_row),
+        };
+        b.rows.push(row);
+    }
+
+    b.current_row.clear();
+    b.current_row.reserve(b.field_defs.len() * 50);
+    b.current_timestamp_ns = timestamp_ns;
+    b.current_field_index = 0;
+
+    GenevaError::Success
+}
+
+/// Write a UTF-8 string field value.
+/// Must be called for the next field in schema order and that field must be of type String.
+///
+/// # Safety
+/// - `builder` must be valid
+/// - `ptr` must point to `len` bytes of valid UTF-8 (or be null with len=0 for empty string)
+/// - The pointed-to data must remain valid only for the duration of this call
+#[no_mangle]
+pub unsafe extern "C" fn geneva_row_write_string(
+    builder: *mut GenevaBatchBuilderHandle,
+    ptr: *const u8,
+    len: usize,
+) -> GenevaError {
+    if builder.is_null() {
+        return GenevaError::NullPointer;
+    }
+    let b = unsafe { builder.as_mut().unwrap() };
+
+    if b.current_field_index >= b.field_types.len() {
+        return GenevaError::IndexOutOfRange;
+    }
+    if b.field_types[b.current_field_index] != GenevaFieldType::String {
+        return GenevaError::InvalidData;
+    }
+
+    if ptr.is_null() || len == 0 {
+        geneva_uploader::BondWriter::write_string(&mut b.current_row, "");
+    } else {
+        let bytes = unsafe { std::slice::from_raw_parts(ptr, len) };
+        match std::str::from_utf8(bytes) {
+            Ok(s) => geneva_uploader::BondWriter::write_string(&mut b.current_row, s),
+            Err(_) => return GenevaError::InvalidData,
+        }
+    }
+
+    b.current_field_index += 1;
+    GenevaError::Success
+}
+
+/// Write a 32-bit signed integer field value.
+///
+/// # Safety
+/// - `builder` must be valid
+#[no_mangle]
+pub unsafe extern "C" fn geneva_row_write_int32(
+    builder: *mut GenevaBatchBuilderHandle,
+    value: i32,
+) -> GenevaError {
+    if builder.is_null() {
+        return GenevaError::NullPointer;
+    }
+    let b = unsafe { builder.as_mut().unwrap() };
+
+    if b.current_field_index >= b.field_types.len() {
+        return GenevaError::IndexOutOfRange;
+    }
+    if b.field_types[b.current_field_index] != GenevaFieldType::Int32 {
+        return GenevaError::InvalidData;
+    }
+
+    geneva_uploader::BondWriter::write_numeric(&mut b.current_row, value);
+    b.current_field_index += 1;
+    GenevaError::Success
+}
+
+/// Write a 64-bit signed integer field value.
+///
+/// # Safety
+/// - `builder` must be valid
+#[no_mangle]
+pub unsafe extern "C" fn geneva_row_write_int64(
+    builder: *mut GenevaBatchBuilderHandle,
+    value: i64,
+) -> GenevaError {
+    if builder.is_null() {
+        return GenevaError::NullPointer;
+    }
+    let b = unsafe { builder.as_mut().unwrap() };
+
+    if b.current_field_index >= b.field_types.len() {
+        return GenevaError::IndexOutOfRange;
+    }
+    if b.field_types[b.current_field_index] != GenevaFieldType::Int64 {
+        return GenevaError::InvalidData;
+    }
+
+    geneva_uploader::BondWriter::write_numeric(&mut b.current_row, value);
+    b.current_field_index += 1;
+    GenevaError::Success
+}
+
+/// Write a 32-bit unsigned integer field value.
+///
+/// # Safety
+/// - `builder` must be valid
+#[no_mangle]
+pub unsafe extern "C" fn geneva_row_write_uint32(
+    builder: *mut GenevaBatchBuilderHandle,
+    value: u32,
+) -> GenevaError {
+    if builder.is_null() {
+        return GenevaError::NullPointer;
+    }
+    let b = unsafe { builder.as_mut().unwrap() };
+
+    if b.current_field_index >= b.field_types.len() {
+        return GenevaError::IndexOutOfRange;
+    }
+    if b.field_types[b.current_field_index] != GenevaFieldType::Uint32 {
+        return GenevaError::InvalidData;
+    }
+
+    geneva_uploader::BondWriter::write_numeric(&mut b.current_row, value);
+    b.current_field_index += 1;
+    GenevaError::Success
+}
+
+/// Write a 64-bit floating point field value.
+///
+/// # Safety
+/// - `builder` must be valid
+#[no_mangle]
+pub unsafe extern "C" fn geneva_row_write_double(
+    builder: *mut GenevaBatchBuilderHandle,
+    value: f64,
+) -> GenevaError {
+    if builder.is_null() {
+        return GenevaError::NullPointer;
+    }
+    let b = unsafe { builder.as_mut().unwrap() };
+
+    if b.current_field_index >= b.field_types.len() {
+        return GenevaError::IndexOutOfRange;
+    }
+    if b.field_types[b.current_field_index] != GenevaFieldType::Double {
+        return GenevaError::InvalidData;
+    }
+
+    geneva_uploader::BondWriter::write_numeric(&mut b.current_row, value);
+    b.current_field_index += 1;
+    GenevaError::Success
+}
+
+/// Write a boolean field value.
+///
+/// # Safety
+/// - `builder` must be valid
+#[no_mangle]
+pub unsafe extern "C" fn geneva_row_write_bool(
+    builder: *mut GenevaBatchBuilderHandle,
+    value: u8,
+) -> GenevaError {
+    if builder.is_null() {
+        return GenevaError::NullPointer;
+    }
+    let b = unsafe { builder.as_mut().unwrap() };
+
+    if b.current_field_index >= b.field_types.len() {
+        return GenevaError::IndexOutOfRange;
+    }
+    if b.field_types[b.current_field_index] != GenevaFieldType::Bool {
+        return GenevaError::InvalidData;
+    }
+
+    geneva_uploader::BondWriter::write_bool(&mut b.current_row, value != 0);
+    b.current_field_index += 1;
+    GenevaError::Success
+}
+
+/// Finish the batch: finalize the last row, assemble the CentralBlob,
+/// compress with LZ4, and return encoded batches.
+///
+/// The builder is consumed and freed by this call (do NOT call
+/// `geneva_batch_builder_free` afterwards).
+///
+/// # Safety
+/// - `handle` must be a valid `GenevaClientHandle`
+/// - `builder` must be a valid pointer returned by `geneva_batch_begin`
+/// - `out_batches` must be non-null
+#[no_mangle]
+pub unsafe extern "C" fn geneva_batch_finish(
+    handle: *mut GenevaClientHandle,
+    builder: *mut GenevaBatchBuilderHandle,
+    out_batches: *mut *mut EncodedBatchesHandle,
+    err_msg_out: *mut c_char,
+    err_msg_len: usize,
+) -> GenevaError {
+    if out_batches.is_null() {
+        return GenevaError::NullPointer;
+    }
+    unsafe { *out_batches = ptr::null_mut() };
+
+    if handle.is_null() || builder.is_null() {
+        return GenevaError::NullPointer;
+    }
+
+    // Validate both handles
+    let validation_result = unsafe { validate_handle(handle) };
+    if validation_result != GenevaError::Success {
+        return validation_result;
+    }
+    let validation_result = unsafe { validate_handle(builder as *const _) };
+    if validation_result != GenevaError::Success {
+        return validation_result;
+    }
+
+    let handle_ref = unsafe { handle.as_ref().unwrap() };
+
+    // Take ownership of builder (it will be freed at the end of this function)
+    unsafe { clear_handle_magic(builder) };
+    let mut b = unsafe { *Box::from_raw(builder) };
+
+    // Finalize last row if in progress
+    if !b.current_row.is_empty() {
+        if b.current_field_index != b.field_defs.len() {
+            let msg = format!(
+                "incomplete final row: expected {} fields, got {}",
+                b.field_defs.len(),
+                b.current_field_index
+            );
+            unsafe { write_error_if_provided(err_msg_out, err_msg_len, &msg) };
+            return GenevaError::InvalidData;
+        }
+        let row = geneva_uploader::RawRow {
+            timestamp_ns: b.current_timestamp_ns,
+            row_data: std::mem::take(&mut b.current_row),
+        };
+        b.rows.push(row);
+    }
+
+    if b.rows.is_empty() {
+        return GenevaError::EmptyInput;
+    }
+
+    // Delegate to library for schema assembly, blob construction, and compression
+    match handle_ref
+        .client
+        .encode_raw_batch(&b.field_defs, &b.event_name, b.level, &b.rows)
+    {
+        Ok(batches) => {
+            let h = EncodedBatchesHandle {
+                magic: GENEVA_HANDLE_MAGIC,
+                batches,
+            };
+            unsafe { *out_batches = Box::into_raw(Box::new(h)) };
+            GenevaError::Success
+        }
+        Err(e) => {
+            unsafe { write_error_if_provided(err_msg_out, err_msg_len, &e) };
+            GenevaError::InternalError
+        }
+    }
+}
+
+/// Free a batch builder without finishing it (discard accumulated data).
+///
+/// Safe to call with NULL (no-op). Do NOT call after `geneva_batch_finish`
+/// (which already frees the builder).
+///
+/// # Safety
+/// - `builder` must be a valid pointer from `geneva_batch_begin`, or null
+#[no_mangle]
+pub unsafe extern "C" fn geneva_batch_builder_free(builder: *mut GenevaBatchBuilderHandle) {
+    if !builder.is_null() {
+        unsafe { clear_handle_magic(builder) };
+        let _ = unsafe { Box::from_raw(builder) };
+    }
+}
+
 /// Returns the number of batches in the encoded batches handle
 ///
 /// # Safety
