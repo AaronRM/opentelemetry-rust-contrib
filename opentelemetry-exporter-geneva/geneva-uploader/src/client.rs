@@ -2,12 +2,15 @@
 
 use crate::config_service::client::{AuthMethod, GenevaConfigClient, GenevaConfigClientConfig};
 // ManagedIdentitySelector removed; no re-export needed.
-use crate::ingestion_service::uploader::{GenevaUploader, GenevaUploaderConfig};
+use crate::ingestion_service::uploader::{
+    GenevaUploader, GenevaUploaderConfig, GenevaUploaderError,
+};
 use crate::payload_encoder::otlp_encoder::MetadataFields;
 use crate::payload_encoder::otlp_encoder::OtlpEncoder;
 use opentelemetry_proto::tonic::logs::v1::ResourceLogs;
 use opentelemetry_proto::tonic::trace::v1::ResourceSpans;
 use std::sync::Arc;
+use std::time::Duration;
 use tracing::{debug, info};
 
 /// Public batch type (already LZ4 chunked compressed).
@@ -34,7 +37,9 @@ pub struct GenevaClientConfig {
     pub role_name: String,
     pub role_instance: String,
     pub msi_resource: Option<String>, // Required for Managed Identity variants
-                                      // Add event name/version here if constant, or per-upload if you want them per call.
+    /// HTTP request timeout for both the config service and upload clients.
+    /// Defaults to 30 seconds if `None`.
+    pub request_timeout: Option<Duration>,
 }
 
 /// Main user-facing client for Geneva ingestion.
@@ -78,6 +83,7 @@ impl GenevaClient {
             #[cfg(feature = "mock_auth")]
             AuthMethod::MockAuth => {}
         }
+        let request_timeout = cfg.request_timeout;
         let config_client_config = GenevaConfigClientConfig {
             endpoint: cfg.endpoint,
             environment: cfg.environment.clone(),
@@ -87,6 +93,7 @@ impl GenevaClient {
             config_major_version: cfg.config_major_version,
             auth_method: cfg.auth_method,
             msi_resource: cfg.msi_resource,
+            request_timeout,
         };
         let config_client =
             Arc::new(GenevaConfigClient::new(config_client_config).map_err(|e| {
@@ -122,6 +129,7 @@ impl GenevaClient {
             source_identity,
             environment: metadata_fields.env_name.clone(),
             config_version: metadata_fields.event_version.clone(),
+            request_timeout,
         };
 
         let uploader =
@@ -209,8 +217,14 @@ impl GenevaClient {
     }
 
     /// Upload a single compressed batch.
-    /// This allows for granular control over uploads, including custom retry logic for individual batches.
-    pub async fn upload_batch(&self, batch: &EncodedBatch) -> Result<(), String> {
+    ///
+    /// On success the batch was accepted by GIG (1PC: treat as committed).
+    ///
+    /// On failure the returned [`UploadError`] carries:
+    /// * `is_retryable` - whether the caller should retry this batch.
+    /// * `retry_after` - an optional server-requested delay before retrying.
+    /// * A human-readable message for logging.
+    pub async fn upload_batch(&self, batch: &EncodedBatch) -> Result<(), UploadError> {
         debug!(
             name: "client.upload_batch",
             target: "geneva-uploader",
@@ -241,9 +255,51 @@ impl GenevaClient {
                     target: "geneva-uploader",
                     event_name = %batch.event_name,
                     error = %e,
+                    retryable = e.is_retryable(),
+                    retry_after = ?e.retry_after(),
                     "Geneva upload failed"
                 );
-                format!("Geneva upload failed: {e} Event: {}", batch.event_name)
+                UploadError::from_uploader_error(e, &batch.event_name)
             })
+    }
+}
+
+/// Structured upload error exposed to callers of [`GenevaClient::upload_batch`].
+///
+/// Contains enough information for the caller (e.g. a retry processor or
+/// exporter) to decide whether to retry, drop, refresh credentials, or
+/// honour a server-requested delay.
+#[derive(Debug)]
+pub struct UploadError {
+    /// Human-readable description of the failure.
+    pub message: String,
+    /// Server-requested delay before retrying, if GIG sent `Retry-After`.
+    pub retry_after: Option<Duration>,
+    /// The classified GIG error kind.
+    pub kind: crate::ingestion_service::uploader::GigErrorKind,
+}
+
+impl std::fmt::Display for UploadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.message)
+    }
+}
+
+impl std::error::Error for UploadError {}
+
+impl UploadError {
+    /// Returns `true` if the error is retryable per the GIG contract.
+    pub fn is_retryable(&self) -> bool {
+        self.kind.is_retryable()
+    }
+
+    fn from_uploader_error(err: GenevaUploaderError, event_name: &str) -> Self {
+        let retry_after = err.retry_after();
+        let kind = err.kind();
+        UploadError {
+            message: format!("Geneva upload failed: {err} Event: {event_name}"),
+            retry_after,
+            kind,
+        }
     }
 }

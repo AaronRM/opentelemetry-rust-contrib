@@ -8,7 +8,7 @@ use reqwest::{
 use serde::Deserialize;
 use std::time::Duration;
 use thiserror::Error;
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 use chrono::{DateTime, Utc};
@@ -146,6 +146,8 @@ pub(crate) type Result<T> = std::result::Result<T, GenevaConfigClientError>;
 ///         path: "/path/to/cert.p12".to_string(),
 ///         password: "password".to_string(),
 ///     },
+///     msi_resource: None,
+///     request_timeout: None,
 /// };
 /// ```
 #[allow(dead_code)]
@@ -159,6 +161,8 @@ pub(crate) struct GenevaConfigClientConfig {
     pub(crate) config_major_version: u32,
     pub(crate) auth_method: AuthMethod, // agent_identity and agent_version are hardcoded for now
     pub(crate) msi_resource: Option<String>, // Required when using any Managed Identity variant
+    /// HTTP request timeout. Defaults to 30 seconds if `None`.
+    pub(crate) request_timeout: Option<Duration>,
 }
 
 #[allow(dead_code)]
@@ -267,7 +271,7 @@ impl GenevaConfigClient {
 
         let mut client_builder = Client::builder()
             .http1_only()
-            .timeout(Duration::from_secs(30)) //TODO - make this configurable
+            .timeout(config.request_timeout.unwrap_or(Duration::from_secs(30)))
             .default_headers(Self::build_static_headers(agent_identity, agent_version));
 
         match &config.auth_method {
@@ -723,6 +727,34 @@ impl GenevaConfigClient {
             fresh_moniker_info,
             token_endpoint,
         ))
+    }
+
+    /// Invalidates the cached GCS token and endpoint data.
+    ///
+    /// Call this after receiving an auth failure (401/403) from GIG so the
+    /// next call to [`get_ingestion_info`] fetches fresh credentials
+    /// instead of re-using a stale token.
+    pub(crate) fn invalidate_cache(&self) {
+        match self.cached_data.write() {
+            Ok(mut guard) => {
+                *guard = None;
+                debug!(
+                    name: "config_client.invalidate_cache",
+                    target: "geneva-uploader",
+                    "Cached GCS auth data invalidated"
+                );
+            }
+            Err(poisoned) => {
+                // Recover through the poison — clearing stale credentials
+                // is more important than propagating the panic.
+                *poisoned.into_inner() = None;
+                warn!(
+                    name: "config_client.invalidate_cache.poisoned",
+                    target: "geneva-uploader",
+                    "Cached GCS auth data invalidated (lock was poisoned)"
+                );
+            }
+        }
     }
 
     /// Internal method that actually fetches data from Geneva Config Service

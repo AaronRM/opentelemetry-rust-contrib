@@ -24,6 +24,7 @@ mod tests {
                 resource: "https://monitor.azure.com".to_string(),
             },
             msi_resource: None,
+            request_timeout: None,
         };
 
         assert_eq!(config.environment, "env");
@@ -115,6 +116,7 @@ mod tests {
                 password,
             },
             msi_resource: None,
+            request_timeout: None,
         };
 
         let client = GenevaConfigClient::new(config).unwrap();
@@ -161,6 +163,7 @@ mod tests {
                 password,
             },
             msi_resource: None,
+            request_timeout: None,
         };
 
         let client = GenevaConfigClient::new(config).unwrap();
@@ -210,6 +213,7 @@ mod tests {
                 password,
             },
             msi_resource: None,
+            request_timeout: None,
         };
 
         let client = GenevaConfigClient::new(config).unwrap();
@@ -242,6 +246,7 @@ mod tests {
                 password: "test".to_string(),
             },
             msi_resource: None,
+            request_timeout: None,
         };
 
         let result = GenevaConfigClient::new(config);
@@ -306,6 +311,7 @@ mod tests {
                 password: cert_password,
             },
             msi_resource: None,
+            request_timeout: None,
         };
 
         println!("Connecting to real Geneva Config service...");

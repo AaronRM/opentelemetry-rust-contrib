@@ -51,6 +51,7 @@ mod tests {
                 source_identity,
                 environment: environment.clone(),
                 config_version,
+                request_timeout: None,
             };
 
             let config = GenevaConfigClientConfig {
@@ -65,6 +66,7 @@ mod tests {
                     password: cert_password,
                 },
                 msi_resource: None,
+                request_timeout: None,
             };
 
             // Build client and uploader
